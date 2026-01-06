@@ -2,4 +2,5 @@ mcp
 fastapi
 uvicorn
 requests
-google-generativeai
+sse-starlette
+google-genai
