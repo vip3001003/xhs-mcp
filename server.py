@@ -9,11 +9,7 @@ from mcp.types import Tool, TextContent
 from google import genai
 
 # ================= 配置区域 =================
-# 1. Google Gemini 配置
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-# 2. 生图模型配置 (Nano Banana Pro)
-# 请在 Render 环境变量中填入该模型的完整 API URL
 IMAGE_API_URL = os.getenv("IMAGE_API_URL") 
 IMAGE_API_KEY = os.getenv("IMAGE_API_KEY")
 
@@ -22,52 +18,71 @@ client = None
 if GOOGLE_API_KEY:
     client = genai.Client(api_key=GOOGLE_API_KEY)
 
-# ================= 核心逻辑 =================
+# ================= 核心逻辑 (已根据你的模版深度优化) =================
 
 def generate_prompt_logic(title: str, content: str) -> str:
-    """使用 Gemini 3 Pro 优化提示词"""
+    """
+    使用 Gemini 3 Pro，根据用户提供的【小红书高爆款模版】生成生图提示词
+    """
     if not client:
-        return f"high quality cover for {title}"
+        return f"xiaohongshu style cover, title '{title}', high quality"
 
-    # 提示词工程：确保输出纯英文、高质量的 Prompt
+    # --- 这里就是我们将你的模版注入给 Gemini 的地方 ---
     system_prompt = """
-    You are an expert AI Art Director. 
-    Your task is to convert the user's Xiaohongshu (RedNote) title and content into a specific English prompt for the "Nano Banana Pro" image model.
-    
-    Guidelines:
-    1. Output MUST be in English.
-    2. Style keywords: Photorealistic, 8k, Soft lighting, High fashion, Minimalist composition.
-    3. NO markdown, NO explanations, just the raw prompt text.
+    You are an expert AI Visual Designer specializing in "Xiaohongshu" (RedNote) cover designs.
+    Your task is to convert the user's Title and Content into a precise English text-to-image prompt for the "Nano Banana Pro" model.
+
+    ### Design Template Requirements (Strictly Follow):
+    1. **Style**: Xiaohongshu Pop Aesthetic, High Click-Through Rate (CTR).
+    2. **Background**: Choose ONE representing the content best: 
+       - A textured notebook page / grid paper.
+       - A clean minimalist desk setup.
+       - A stylized floating chat window interface.
+    3. **Typography & Layout**:
+       - The MAIN TITLE must be the visual focus (occupy 40% of space, bold, bubble or 3D font).
+       - Visual Hierarchy: Title size > 2x Body text size.
+       - Allow for white space (negative space) between text blocks.
+    4. **Color**: Use eye-catching highlight colors (like bright yellow, neon pink, or electric blue) ONLY for key words.
+    5. **Icons**: Add relevant 3D icons, stickers, or emojis (e.g., muscles, sparks, palettes) to add visual layers without clutter.
+    6. **Aspect Ratio**: Vertical 9:16 composition.
+
+    ### Output Format:
+    - Output ONLY the final English prompt string.
+    - Include the exact text to render inside single quotes, e.g., text 'YOUR TITLE'. 
+    - Add style boosters: "best quality, 8k, c4d render, blender style, vector illustration, poster design".
+
+    ### User Input:
     """
     
     user_input = f"Title: {title}\nContent: {content}"
 
     try:
+        # 使用 gemini-2.0-flash 或 gemini-1.5-pro (等待 3 Pro)
+        # 这里的指令非常复杂，建议使用能力更强的模型
         response = client.models.generate_content(
-            model="gemini-3-pro", # 这里指定了 Gemini 3 Pro，如果报错请改为 gemini-1.5-pro
+            model="gemini-2.0-flash", 
             contents=[system_prompt, user_input]
         )
         return response.text.strip()
     except Exception as e:
         print(f"Gemini Error: {e}")
-        # 降级处理，防止流程中断
-        return f"A creative cover image about {title}, high aesthetic, 8k resolution"
+        return f"poster design regarding {title}, minimalist, 8k"
 
 def call_image_api(prompt: str) -> str:
     """调用真实的生图 API"""
-    if not IMAGE_API_URL or not IMAGE_API_KEY:
-        return "Error: Missing IMAGE_API_URL or IMAGE_API_KEY in environment variables."
+    if not IMAGE_API_URL:
+        return "Error: Missing IMAGE_API_URL"
 
     print(f"Calling Image API with prompt: {prompt[:50]}...")
 
-    # 这里的 Payload 结构是目前最通用的 (兼容 Replicate/SiliconFlow 等)
-    # 如果你的服务商要求不同的参数（比如 'text' 而不是 'prompt'），请在这里修改
+    # 针对 Nano Banana Pro / Flux 类型的通用 Payload
+    # 注意：如果你的模型支持 width/height 参数，请确保是 9:16 比例 (如 768x1344 或 1024x1792)
     payload = {
         "prompt": prompt,
-        "model": "nano-banana-pro", # 部分 API 需要指定模型名
-        "image_size": "1024x1024",  # 或者 width: 1024, height: 1024
+        "model": "nano-banana-pro", 
+        "image_size": "1024x1792", # 设置为 9:16 竖屏比例
         "num_inference_steps": 30,
-        "guidance_scale": 7.5
+        "guidance_scale": 7.0
     }
 
     headers = {
@@ -78,44 +93,40 @@ def call_image_api(prompt: str) -> str:
 
     try:
         response = requests.post(IMAGE_API_URL, json=payload, headers=headers, timeout=60)
-        response.raise_for_status() # 如果状态码不是 200，抛出异常
         
+        # 调试用：如果报错，打印返回内容查看原因
+        if response.status_code != 200:
+            print(f"API Error Response: {response.text}")
+            
+        response.raise_for_status()
         data = response.json()
         
-        # === 关键：解析不同服务商的返回格式 ===
-        # 情况 A: 直接返回 {"image_url": "https://..."}
-        if "image_url" in data:
-            return data["image_url"]
-        
-        # 情况 B: Replicate 风格 {"output": ["https://..."]}
-        if "output" in data and isinstance(data["output"], list):
-            return data["output"][0]
-            
-        # 情况 C: SiliconFlow/OpenAI 风格 {"data": [{"url": "..."}]}
-        if "data" in data and isinstance(data["data"], list):
-            return data["data"][0].get("url")
+        # 兼容多种常见的 API 返回格式
+        if "image_url" in data: return data["image_url"]
+        if "output" in data and data["output"]: return data["output"][0]
+        if "data" in data and data["data"]: return data["data"][0].get("url")
+        if "images" in data and data["images"]: return data["images"][0].get("url") #有时候是 base64
 
-        return f"Error: Unknown API response format: {str(data)[:100]}"
+        return f"Error: Unknown response format: {str(data)[:50]}"
 
     except Exception as e:
-        print(f"Image API Error: {e}")
         return f"Error generating image: {str(e)}"
 
 # ================= MCP Server 定义 =================
 app = FastAPI()
-mcp = Server("xhs-cover-mcp-v2")
+mcp = Server("xhs-cover-mcp-v3")
 
 @mcp.list_tools()
 async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="generate_xhs_cover",
-            description="Generate generic Xiaohongshu cover image using Gemini 3 Pro and Nano Banana Pro",
+            description="Generate a High-CTR Xiaohongshu cover image (9:16)",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": "The post title"},
-                    "content": {"type": "string", "description": "The post content details"},
+                    "title": {"type": "string", "description": "The main headline"},
+                    "content": {"type": "string", "description": "Key bullet points"},
                 },
                 "required": ["title", "content"],
             },
@@ -128,17 +139,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         title = arguments.get("title", "")
         content = arguments.get("content", "")
         
-        # 1. 生成提示词
         prompt = generate_prompt_logic(title, content)
-        
-        # 2. 生成图片
         image_url = call_image_api(prompt)
         
         return [TextContent(type="text", text=image_url)]
     
     raise ValueError(f"Unknown tool: {name}")
 
-# SSE 路由支持
 @app.get("/sse")
 async def handle_sse(request: Request):
     async def event_generator():
