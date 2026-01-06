@@ -1,84 +1,157 @@
 import os
 import uvicorn
 import requests
-import google.generativeai as genai
-from mcp.server.fastapi import FastAPIServer
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request
+from sse_starlette.sse import EventSourceResponse
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from mcp.types import Tool, TextContent
+from google import genai
 
-# ================= 1. 获取配置 (从云端环境变量) =================
-# 如果你在本地运行报错，是因为没有设置环境变量，不用担心，部署到云端后并在Render里填写即可
+# ================= 配置区域 =================
+# 1. Google Gemini 配置
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-IMAGE_API_URL = os.getenv("IMAGE_API_URL")
+
+# 2. 生图模型配置 (Nano Banana Pro)
+# 请在 Render 环境变量中填入该模型的完整 API URL
+IMAGE_API_URL = os.getenv("IMAGE_API_URL") 
 IMAGE_API_KEY = os.getenv("IMAGE_API_KEY")
 
-# 初始化 Gemini (如果有 Key)
+# 初始化 Google 客户端
+client = None
 if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-pro')
+    client = genai.Client(api_key=GOOGLE_API_KEY)
 
-# ================= 2. 核心功能函数 =================
+# ================= 核心逻辑 =================
+
 def generate_prompt_logic(title: str, content: str) -> str:
-    """使用 Gemini 把中文文案变成英文生图提示词"""
-    if not GOOGLE_API_KEY:
-        return f"minimalist cover regarding {title}, high quality"
-        
-    system_instruction = "你是一个AI绘画提示词专家。请根据内容生成一段适配 Flux/SDXL 模型的英文提示词，强调高审美、摄影感、胶片质感。直接返回英文。"
-    user_input = f"标题：{title}\n内容：{content}"
+    """使用 Gemini 3 Pro 优化提示词"""
+    if not client:
+        return f"high quality cover for {title}"
+
+    # 提示词工程：确保输出纯英文、高质量的 Prompt
+    system_prompt = """
+    You are an expert AI Art Director. 
+    Your task is to convert the user's Xiaohongshu (RedNote) title and content into a specific English prompt for the "Nano Banana Pro" image model.
     
+    Guidelines:
+    1. Output MUST be in English.
+    2. Style keywords: Photorealistic, 8k, Soft lighting, High fashion, Minimalist composition.
+    3. NO markdown, NO explanations, just the raw prompt text.
+    """
+    
+    user_input = f"Title: {title}\nContent: {content}"
+
     try:
-        response = model.generate_content([system_instruction, user_input])
+        response = client.models.generate_content(
+            model="gemini-3-pro", # 这里指定了 Gemini 3 Pro，如果报错请改为 gemini-1.5-pro
+            contents=[system_prompt, user_input]
+        )
         return response.text.strip()
     except Exception as e:
         print(f"Gemini Error: {e}")
-        return f"minimalist cover regarding {title}, high quality"
+        # 降级处理，防止流程中断
+        return f"A creative cover image about {title}, high aesthetic, 8k resolution"
 
 def call_image_api(prompt: str) -> str:
-    """调用生图 API"""
-    # 这里的代码逻辑用于连接真实的 Nano Banana Pro
-    # 为了防止你刚部署没有 Key 导致报错，这里默认先返回一个模拟图片
-    # 如果要开启真实生图，请部署后确保环境变量填写正确，并修改下方代码
+    """调用真实的生图 API"""
+    if not IMAGE_API_URL or not IMAGE_API_KEY:
+        return "Error: Missing IMAGE_API_URL or IMAGE_API_KEY in environment variables."
+
+    print(f"Calling Image API with prompt: {prompt[:50]}...")
+
+    # 这里的 Payload 结构是目前最通用的 (兼容 Replicate/SiliconFlow 等)
+    # 如果你的服务商要求不同的参数（比如 'text' 而不是 'prompt'），请在这里修改
+    payload = {
+        "prompt": prompt,
+        "model": "nano-banana-pro", # 部分 API 需要指定模型名
+        "image_size": "1024x1024",  # 或者 width: 1024, height: 1024
+        "num_inference_steps": 30,
+        "guidance_scale": 7.5
+    }
+
+    headers = {
+        "Authorization": f"Bearer {IMAGE_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+    try:
+        response = requests.post(IMAGE_API_URL, json=payload, headers=headers, timeout=60)
+        response.raise_for_status() # 如果状态码不是 200，抛出异常
+        
+        data = response.json()
+        
+        # === 关键：解析不同服务商的返回格式 ===
+        # 情况 A: 直接返回 {"image_url": "https://..."}
+        if "image_url" in data:
+            return data["image_url"]
+        
+        # 情况 B: Replicate 风格 {"output": ["https://..."]}
+        if "output" in data and isinstance(data["output"], list):
+            return data["output"][0]
+            
+        # 情况 C: SiliconFlow/OpenAI 风格 {"data": [{"url": "..."}]}
+        if "data" in data and isinstance(data["data"], list):
+            return data["data"][0].get("url")
+
+        return f"Error: Unknown API response format: {str(data)[:100]}"
+
+    except Exception as e:
+        print(f"Image API Error: {e}")
+        return f"Error generating image: {str(e)}"
+
+# ================= MCP Server 定义 =================
+app = FastAPI()
+mcp = Server("xhs-cover-mcp-v2")
+
+@mcp.list_tools()
+async def list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="generate_xhs_cover",
+            description="Generate generic Xiaohongshu cover image using Gemini 3 Pro and Nano Banana Pro",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "The post title"},
+                    "content": {"type": "string", "description": "The post content details"},
+                },
+                "required": ["title", "content"],
+            },
+        )
+    ]
+
+@mcp.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    if name == "generate_xhs_cover":
+        title = arguments.get("title", "")
+        content = arguments.get("content", "")
+        
+        # 1. 生成提示词
+        prompt = generate_prompt_logic(title, content)
+        
+        # 2. 生成图片
+        image_url = call_image_api(prompt)
+        
+        return [TextContent(type="text", text=image_url)]
     
-    # --- 模拟模式 (免费，用于测试连接) ---
-    # 这会根据提示词生成一个简单的 AI 图片 (来自 Pollinations AI)
-    safe_prompt = prompt.replace(' ', '%20')
-    return f"https://image.pollinations.ai/prompt/{safe_prompt}?nologo=true"
+    raise ValueError(f"Unknown tool: {name}")
 
-    # --- 真实模式 (填入 Key 后使用) ---
-    # headers = {
-    #     "Authorization": f"Bearer {IMAGE_API_KEY}",
-    #     "Content-Type": "application/json"
-    # }
-    # payload = {
-    #     "prompt": prompt,
-    #     "image_size": "1024x1024", 
-    #     "num_inference_steps": 25
-    # }
-    # try:
-    #     resp = requests.post(IMAGE_API_URL, json=payload, headers=headers)
-    #     resp.raise_for_status()
-    #     # 根据你的 API 返回格式修改下面这行
-    #     return resp.json().get('output')[0] 
-    # except Exception as e:
-    #     return f"Error: {str(e)}"
+# SSE 路由支持
+@app.get("/sse")
+async def handle_sse(request: Request):
+    async def event_generator():
+        transport = SseServerTransport("/messages")
+        async with mcp.run(transport.read_incoming, transport.write_outgoing):
+            async for message in transport.outgoing_messages:
+                yield message
+    return EventSourceResponse(event_generator())
 
-# ================= 3. 定义 MCP 服务器 =================
-mcp = FastAPIServer("xhs-cover-mcp")
+@app.post("/messages")
+async def handle_messages(request: Request):
+    return await mcp.process_request(request)
 
-class XHSParams(BaseModel):
-    title: str = Field(..., description="小红书标题")
-    content: str = Field(..., description="小红书正文内容")
-
-@mcp.tool(name="generate_xhs_cover", description="生成小红书封面图")
-async def generate_xhs_cover(params: XHSParams) -> str:
-    # 第一步：写提示词
-    prompt = generate_prompt_logic(params.title, params.content)
-    # 第二步：生图
-    url = call_image_api(prompt)
-    return url
-
-# ================= 4. 启动设置 =================
 if __name__ == "__main__":
-    # 获取云平台分配的端口，默认为 8000
     port = int(os.environ.get("PORT", 8000))
-    print(f"Starting server on 0.0.0.0:{port}")
-    uvicorn.run(mcp.app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
